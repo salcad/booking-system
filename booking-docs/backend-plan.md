@@ -365,3 +365,64 @@ payment provider and its webhooks, waitlists for full classes, multi-seat or
 sibling bookings, class timezone handling, notification email, and a
 transactional outbox for confirmation events. Each is listed in the README with
 one line on why it was cut and what it would take to add.
+
+---
+
+## 12. Implementation notes — where the build deviated from this plan
+
+Recorded as they were found, so the README and `AI_USAGE.md` can cite specifics
+rather than generalities.
+
+### 12.1 The reaper's transaction was a no-op (correctness bug)
+
+`HoldReaper.sweep()` called `releaseExpiredHolds()` on `this`. Spring's
+`@Transactional` is proxy-based, so a self-invocation bypasses the interceptor
+entirely and the annotation did nothing on the scheduled path. Every statement
+autocommitted, which meant the `FOR UPDATE SKIP LOCKED` row lock was released
+the instant the `SELECT` returned — exactly the serialisation §4.3 depends on.
+
+The failure it allowed: the reaper reads a booking as `PENDING_PAYMENT`,
+`PaymentService` confirms and commits it, and the reaper's unconditional
+`UPDATE ... WHERE id = ?` then overwrites it to `EXPIRED` and releases the seat.
+A paid student silently drops off the roster.
+
+Two changes, because one was not enough:
+
+1. **A `TransactionTemplate` instead of `@Transactional`.** Programmatic
+   demarcation is proxy-independent, so the transaction is real regardless of
+   the call path — the scheduler, or a test calling the method directly.
+2. **`expireIfStillPending`, a conditional transition.** The expiry `UPDATE` now
+   carries `AND status = 'PENDING_PAYMENT'`, and only the caller that actually
+   performed the transition releases the seat. This mirrors `tryClaimSeat`: the
+   guard lives in the statement, so the outcome is correct even if the
+   surrounding transaction were lost again in a future refactor.
+
+`ReaperPaymentRaceTest` pins this down. Reverting change (1) alone makes it fail
+hard — 0 of 12 confirmed bookings survive instead of 12 — which is the evidence
+that the test earns its place rather than merely passing.
+
+### 12.2 The catch-all exception handler downgraded client errors to 500
+
+`@ExceptionHandler(Exception.class)` outranks Spring's own resolvers, so a
+missing required field and an unknown route were both reported as
+`500 INTERNAL_ERROR`. Added explicit handlers for `MethodArgumentNotValidException`
+(400 `VALIDATION_ERROR`), `HttpMessageNotReadableException` (400
+`MALFORMED_REQUEST`), and `ErrorResponseException` (passes Spring's own status
+through). Covered by two cases in `LastSeatRaceHttpTest`.
+
+### 12.3 Test isolation: the reaper sweeps globally
+
+The first draft of `HoldExpiryTest` asserted on the sweep's global return count.
+That is not a test-scoped quantity — sibling tests sharing the suite's container
+leave their own expired holds behind, so the count is whatever the suite
+happened to do beforehand. Assertions are now scoped to the class under test.
+The tests build their own fixtures rather than asserting against `V2__seed.sql`,
+so the seed file stays free to change for demo purposes.
+
+### 12.4 Added beyond the plan
+
+- `ParentRepository` + `GET /api/parents` — the UI needs a parent to act as,
+  standing in for authentication.
+- `RaceDemoService` uses a `CyclicBarrier`, not a start latch, so contenders
+  genuinely collide instead of trickling through and making the demo look safer
+  than it is.

@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    name: Backend tests (JUnit + Testcontainers)
+    runs-on: ubuntu-latest
+    # The suite starts its own Postgres 16 through Testcontainers rather than a
+    # service container, so the tests run identically here and on a laptop.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+
+      - name: Run tests
+        working-directory: booking-be
+        run: mvn --batch-mode verify
+
+      - name: Publish test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: booking-be/target/surefire-reports/
+          if-no-files-found: ignore

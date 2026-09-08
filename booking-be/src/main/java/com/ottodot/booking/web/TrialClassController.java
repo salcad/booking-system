@@ -1,6 +1,8 @@
 package com.ottodot.booking.web;
 
+import com.ottodot.booking.domain.Parent;
 import com.ottodot.booking.error.ApiException;
+import com.ottodot.booking.repo.ParentRepository;
 import com.ottodot.booking.repo.StudentRepository;
 import com.ottodot.booking.repo.TrialClassRepository;
 import com.ottodot.booking.service.RosterService;
@@ -16,12 +18,14 @@ public class TrialClassController {
 
     private final TrialClassRepository classes;
     private final StudentRepository students;
+    private final ParentRepository parents;
     private final RosterService rosters;
 
     public TrialClassController(TrialClassRepository classes, StudentRepository students,
-                                RosterService rosters) {
+                                ParentRepository parents, RosterService rosters) {
         this.classes = classes;
         this.students = students;
+        this.parents = parents;
         this.rosters = rosters;
     }
 
@@ -40,6 +44,12 @@ public class TrialClassController {
     @GetMapping("/trial-classes/{id}/roster")
     public RosterService.Roster roster(@PathVariable long id) {
         return rosters.forClass(id);
+    }
+
+    /** Stands in for authentication: the UI picks a parent instead of logging in. */
+    @GetMapping("/parents")
+    public List<Parent> parents() {
+        return parents.findAll();
     }
 
     @GetMapping("/parents/{parentId}/students")

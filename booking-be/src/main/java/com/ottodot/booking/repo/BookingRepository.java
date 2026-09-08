@@ -74,6 +74,26 @@ public class BookingRepository {
     }
 
     /**
+     * Expires a hold, but only if it is still PENDING_PAYMENT.
+     *
+     * <p>Deliberately conditional, in the same spirit as tryClaimSeat. The
+     * reaper's transaction already serialises it against the payment path, but
+     * an unconditional "UPDATE ... WHERE id = ?" would silently overwrite a
+     * booking that payment confirmed between the sweep's read and its write —
+     * taking a paid student off the roster and releasing their seat. Making the
+     * transition itself conditional means only the caller that genuinely
+     * performed it releases the seat, whatever the surrounding isolation.
+     *
+     * @return true if this call performed the transition
+     */
+    public boolean expireIfStillPending(long bookingId) {
+        return jdbc.update(
+                "UPDATE bookings SET status = 'EXPIRED', hold_expires_at = NULL, "
+                        + "updated_at = now() WHERE id = ? AND status = 'PENDING_PAYMENT'",
+                bookingId) == 1;
+    }
+
+    /**
      * Expired holds, locked for this transaction.
      *
      * <p>SKIP LOCKED is deliberate: a booking whose row is currently locked is

@@ -13,7 +13,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * Releases seats held by parents who never completed checkout.
@@ -34,12 +35,29 @@ public class HoldReaper {
     private final Clock clock;
     private final Counter holdsExpired;
 
+    /**
+     * Deliberately a TransactionTemplate rather than @Transactional.
+     *
+     * <p>The scheduled entry point calls the sweep directly on {@code this},
+     * which does not pass through the Spring proxy — an @Transactional
+     * annotation would silently do nothing there, leaving every statement to
+     * autocommit. That would drop the FOR UPDATE lock the instant the SELECT
+     * returned and let the reaper expire a booking that PaymentService was
+     * concurrently confirming, releasing a seat still held by a confirmed
+     * student. Programmatic demarcation is proxy-independent, so the
+     * transaction is real no matter who calls the method — the scheduler, or a
+     * test invoking it directly.
+     */
+    private final TransactionTemplate tx;
+
     public HoldReaper(BookingRepository bookings, TrialClassRepository classes,
-                      BookingEventRepository events, Clock clock, MeterRegistry metrics) {
+                      BookingEventRepository events, Clock clock, MeterRegistry metrics,
+                      PlatformTransactionManager txManager) {
         this.bookings = bookings;
         this.classes = classes;
         this.events = events;
         this.clock = clock;
+        this.tx = new TransactionTemplate(txManager);
         this.holdsExpired = Counter.builder("booking.holds_expired")
                 .description("Seat holds released after the checkout window lapsed")
                 .register(metrics);
@@ -61,18 +79,27 @@ public class HoldReaper {
     /**
      * One transaction per sweep. lockExpiredHolds uses FOR UPDATE SKIP LOCKED,
      * so a booking that is currently mid-payment (its row locked by
-     * PaymentService) is skipped rather than expired underneath the parent.
+     * PaymentService) is skipped rather than expired underneath the parent, and
+     * the lock is held until this transaction commits.
      */
-    @Transactional
     public int releaseExpiredHolds() {
-        List<Booking> expired = bookings.lockExpiredHolds(clock.instant(), BATCH_SIZE);
-        for (Booking booking : expired) {
-            bookings.updateStatus(booking.id(), BookingStatus.EXPIRED, null);
-            classes.releaseSeat(booking.trialClassId());
-            events.append(booking.id(), BookingStatus.PENDING_PAYMENT, BookingStatus.EXPIRED,
-                    "hold expired before payment", "system");
-            holdsExpired.increment();
-        }
-        return expired.size();
+        Integer released = tx.execute(status -> {
+            List<Booking> expired = bookings.lockExpiredHolds(clock.instant(), BATCH_SIZE);
+            int count = 0;
+            for (Booking booking : expired) {
+                // Conditional: if payment confirmed this booking first, the
+                // transition matches no rows and the seat is left alone.
+                if (!bookings.expireIfStillPending(booking.id())) {
+                    continue;
+                }
+                classes.releaseSeat(booking.trialClassId());
+                events.append(booking.id(), BookingStatus.PENDING_PAYMENT, BookingStatus.EXPIRED,
+                        "hold expired before payment", "system");
+                holdsExpired.increment();
+                count++;
+            }
+            return count;
+        });
+        return released == null ? 0 : released;
     }
 }
