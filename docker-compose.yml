@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:16
+    container_name: ottodot-booking-db
+    environment:
+      POSTGRES_DB: booking
+      POSTGRES_USER: booking
+      POSTGRES_PASSWORD: booking
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U booking -d booking"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - booking-db-data:/var/lib/postgresql/data
+
+volumes:
+  booking-db-data:

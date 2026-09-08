@@ -1,0 +1,24 @@
+# Java
+target/
+*.class
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# Env
+.env
+.env.local
+
+# Editors / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# Take-home instructions (not for publication)
+Ottodot_Full_Stack_Take_Home_Instructions.pdf
