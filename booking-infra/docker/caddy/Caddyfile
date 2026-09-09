@@ -1,0 +1,23 @@
+# Terminates TLS for the public domain and forwards everything to the Next.js
+# container. Caddy obtains and renews the certificate itself; nothing here needs
+# to be edited per-deployment — the domain and email come from the environment.
+{
+	email {$ACME_EMAIL}
+}
+
+{$PUBLIC_DOMAIN} {
+	encode zstd gzip
+
+	# The app is entirely dynamic — seat counts must never be served stale — so
+	# no caching layer is inserted here.
+	# The API's /api/demo/* endpoints wipe the database and spawn threads on
+	# demand. They are what the race-demo page drives, so they are left open by
+	# default — uncomment to shut them off on a deployment that is public but
+	# not meant to be reset by strangers.
+	# respond /api/demo/* 404
+
+	reverse_proxy web:8073 {
+		health_uri /
+		health_interval 30s
+	}
+}

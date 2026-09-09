@@ -15,7 +15,10 @@ import com.ottodot.booking.repo.StudentRepository;
 import com.ottodot.booking.repo.TrialClassRepository;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import java.time.Clock;
+import java.time.Duration;
 import org.slf4j.Logger;
+import org.springframework.dao.DuplicateKeyException;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -32,10 +35,11 @@ public class PaymentService {
     private final PaymentAttemptRepository payments;
     private final BookingEventRepository events;
     private final PaymentGateway gateway;
+    private final Clock clock;
+    private final Duration holdDuration;
     private final int priceCents;
 
     private final Counter paymentFailures;
-    private final Counter refundsIssued;
 
     public PaymentService(BookingRepository bookings,
                           TrialClassRepository classes,
@@ -44,6 +48,8 @@ public class PaymentService {
                           BookingEventRepository events,
                           PaymentGateway gateway,
                           MeterRegistry metrics,
+                          Clock clock,
+                          @Value("${booking.hold-duration}") Duration holdDuration,
                           @Value("${booking.trial-price-cents}") int priceCents) {
         this.bookings = bookings;
         this.classes = classes;
@@ -51,12 +57,11 @@ public class PaymentService {
         this.payments = payments;
         this.events = events;
         this.gateway = gateway;
+        this.clock = clock;
+        this.holdDuration = holdDuration;
         this.priceCents = priceCents;
         this.paymentFailures = Counter.builder("booking.payment_failures")
                 .description("Declined payment attempts").register(metrics);
-        this.refundsIssued = Counter.builder("booking.refunds_issued")
-                .description("Charges refunded because the seat was lost mid-payment")
-                .register(metrics);
     }
 
     /**
@@ -92,42 +97,65 @@ public class PaymentService {
         Student student = students.findById(booking.studentId()).orElseThrow();
         boolean decline = requestDecline || student.alwaysFailsPayment();
 
+        String reason = "payment succeeded";
+        if (booking.status() == BookingStatus.EXPIRED) {
+            // The reaper won the row and released the seat before this payment
+            // landed. Re-acquire everything BEFORE charging, so the gateway is
+            // never called unless the outcome is already guaranteed.
+            booking = reacquire(booking);
+            reason = "payment succeeded after hold expiry; seat reclaimed";
+        }
+
         ChargeResult charge = gateway.charge(bookingId, priceCents, decline);
 
         if (!charge.approved()) {
             return recordDecline(booking, idempotencyKey, charge);
         }
 
-        long attemptId = payments.insert(bookingId, idempotencyKey, priceCents,
+        payments.insert(bookingId, idempotencyKey, priceCents,
                 PaymentStatus.SUCCEEDED, charge.providerRef());
 
-        if (booking.status() == BookingStatus.PENDING_PAYMENT) {
-            // The reaper has not run, and cannot run while we hold this row
-            // lock. The seat is therefore provably still claimed: confirming
-            // converts a held seat into a confirmed one, so claimed_seats is
-            // deliberately left unchanged.
-            return confirm(booking, "payment succeeded");
+        // The booking is PENDING_PAYMENT and its row is locked, so the reaper
+        // cannot touch it; the seat is provably claimed and the live-booking
+        // slot is provably ours. Confirming therefore cannot fail: it changes
+        // status within the set the unique index covers, and leaves
+        // claimed_seats alone because a held seat is already a claimed one.
+        return confirm(booking, reason);
+    }
+
+    /**
+     * Takes back the seat and the live-booking slot for an expired hold.
+     *
+     * <p>Both reservations happen before any charge, which is the whole point.
+     * Charging first and reserving afterwards means every failure past that
+     * line is a failure holding someone's money: a lost seat becomes a refund,
+     * and a duplicate booking becomes a constraint violation that rolls the
+     * payment record back while the money stays gone.
+     *
+     * <p>Neither failure below charges anyone.
+     */
+    private Booking reacquire(Booking booking) {
+        if (!classes.tryClaimSeat(booking.trialClassId())) {
+            log.info("booking {} cannot be paid: seat taken during checkout", booking.id());
+            throw ApiException.conflict("SEAT_UNAVAILABLE",
+                    "This seat was taken while you were checking out. You have not been charged.");
         }
 
-        // booking.status() == EXPIRED: the reaper won the row and released the
-        // seat before this payment landed. Try to take it back.
-        if (classes.tryClaimSeat(booking.trialClassId())) {
-            return confirm(booking, "payment succeeded after hold expiry; seat reclaimed");
+        try {
+            if (!bookings.reopenHold(booking.id(), clock.instant().plus(holdDuration))) {
+                // Another request reopened it first; that request owns the slot.
+                throw ApiException.conflict("NOT_PAYABLE",
+                        "This booking is already being paid for.");
+            }
+        } catch (DuplicateKeyException e) {
+            // The child acquired another live booking for this class while this
+            // hold was expired. The whole transaction rolls back, which undoes
+            // the seat claim above - and, crucially, no charge has happened.
+            log.info("booking {} cannot be paid: child already has a live booking", booking.id());
+            throw ApiException.duplicateBooking();
         }
 
-        // The only path in the system that returns money: charged, but the seat
-        // was taken while this parent was checking out.
-        gateway.refund(charge.providerRef());
-        payments.markRefunded(attemptId);
-        refundsIssued.increment();
-        bookings.updateStatus(bookingId, BookingStatus.CANCELLED, null);
-        events.append(bookingId, booking.status(), BookingStatus.CANCELLED,
-                "SEAT_UNAVAILABLE: refunded", "system");
-        log.warn("booking {} refunded: seat taken during checkout", bookingId);
-
-        return new PaymentResult(bookings.findById(bookingId).orElseThrow(),
-                PaymentStatus.REFUNDED, PaymentResult.Outcome.SEAT_UNAVAILABLE,
-                "Your payment was refunded - this seat was taken while you were checking out.");
+        return bookings.findById(booking.id()).orElseThrow();
     }
 
     private PaymentResult confirm(Booking booking, String reason) {
@@ -160,9 +188,16 @@ public class PaymentService {
     }
 
     private PaymentResult describeExisting(Booking booking, PaymentAttempt attempt) {
+        if (attempt.status() == PaymentStatus.SUCCEEDED
+                && booking.status() != BookingStatus.CONFIRMED) {
+            // A successful charge always confirms in the same transaction, so
+            // this combination should be unreachable. Say so loudly rather than
+            // reporting the booking as confirmed when it demonstrably is not.
+            log.error("booking {} has a SUCCEEDED payment but status {}",
+                    booking.id(), booking.status());
+        }
         PaymentResult.Outcome outcome = switch (attempt.status()) {
-            case SUCCEEDED -> booking.status() == BookingStatus.CONFIRMED
-                    ? PaymentResult.Outcome.ALREADY_CONFIRMED : PaymentResult.Outcome.CONFIRMED;
+            case SUCCEEDED -> PaymentResult.Outcome.ALREADY_CONFIRMED;
             case FAILED -> PaymentResult.Outcome.DECLINED;
             case REFUNDED -> PaymentResult.Outcome.SEAT_UNAVAILABLE;
         };

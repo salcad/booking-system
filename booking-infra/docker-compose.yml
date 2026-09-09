@@ -1,0 +1,124 @@
+# Production stack for an Ubuntu VPS: Postgres, the Spring Boot API, and the
+# Next.js UI. Run it from this directory — compose reads ./.env for the values
+# interpolated below, and the build contexts are relative to this file.
+#
+#   cp .env.example .env && edit .env
+#   docker compose up -d --build
+#
+# Only the web container publishes a port. The API and the database talk over
+# the private compose network, so a VPS with a bare firewall does not end up
+# exposing Postgres or the demo endpoints to the internet.
+
+name: booking
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-booking}
+      POSTGRES_USER: ${POSTGRES_USER:-booking}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      # Postgres only initialises a data directory it owns exclusively, and a
+      # bind-mounted volume root can carry a lost+found. A subdirectory avoids it.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-booking} -d ${POSTGRES_DB:-booking}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    # Uncomment to reach the database from the VPS itself (psql, a dump). It
+    # binds to loopback only, so it is still not reachable from outside the box.
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  api:
+    build:
+      context: ../booking-be
+      dockerfile: ../booking-infra/docker/backend.Dockerfile
+    image: booking-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://db:5432/${POSTGRES_DB:-booking}
+      DB_USER: ${POSTGRES_USER:-booking}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      # application.yml logs this package at DEBUG for local work. On a VPS that
+      # is a lot of disk for very little, so production turns it down.
+      LOGGING_LEVEL_COM_OTTODOT_BOOKING: ${API_LOG_LEVEL:-INFO}
+      # Spring's relaxed binding maps these onto booking.* in application.yml.
+      BOOKING_HOLDDURATION: ${BOOKING_HOLD_DURATION:-PT10M}
+      BOOKING_TRIALPRICECENTS: ${BOOKING_TRIAL_PRICE_CENTS:-4900}
+      JAVA_OPTS: ${JAVA_OPTS:--XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError}
+    deploy:
+      resources:
+        limits:
+          memory: ${API_MEMORY:-768m}
+    logging: *logging
+
+  web:
+    build:
+      context: ../booking-fe
+      dockerfile: ../booking-infra/docker/frontend.Dockerfile
+      args:
+        # Baked into the build because next.config.ts is serialised into the
+        # standalone server; also set at runtime below.
+        API_BASE: http://api:8074
+    image: booking-web:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      # Server components fetch this directly; the /api/* rewrite proxies the
+      # browser's calls to it. Either way the backend stays off the public net.
+      API_BASE: http://api:8074
+    ports:
+      # Default publishes on :8073. Behind the tls profile set WEB_PORT to
+      # 127.0.0.1:8073 in .env so only Caddy can reach it.
+      - "${WEB_PORT:-8073}:8073"
+    deploy:
+      resources:
+        limits:
+          memory: ${WEB_MEMORY:-512m}
+    logging: *logging
+
+  # Opt-in TLS terminator: `docker compose --profile tls up -d`. Caddy fetches
+  # and renews a Let's Encrypt certificate for PUBLIC_DOMAIN on its own, which
+  # is why it is here rather than an nginx config the deployer has to maintain.
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["tls"]
+    restart: unless-stopped
+    depends_on:
+      - web
+    environment:
+      # Compose interpolates this even when the profile is inactive, so it
+      # cannot be a required variable. Caddy exits with a config error if the
+      # tls profile is started without it, which is the right place to fail.
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:-}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    logging: *logging
+
+volumes:
+  db-data:
+  caddy-data:
+  caddy-config:

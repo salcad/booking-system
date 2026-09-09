@@ -1,7 +1,9 @@
 package com.ottodot.booking;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.ottodot.booking.error.ApiException;
 import com.ottodot.booking.scheduler.HoldReaper;
 import com.ottodot.booking.service.BookingService;
 import com.ottodot.booking.service.PaymentResult;
@@ -54,8 +56,8 @@ class ConfirmAfterExpiryTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("payment after expiry is refunded when the seat is gone")
-    void refundsWhenSeatWasTakenDuringCheckout() {
+    @DisplayName("payment after expiry is refused, uncharged, when the seat is gone")
+    void refusesWithoutChargingWhenSeatWasTakenDuringCheckout() {
         long classId = fixtures.trialClassWithConfirmed(4, 3);
         long slowParentsChild = fixtures.student(fixtures.parent());
         long fastParentsChild = fixtures.student(fixtures.parent());
@@ -70,18 +72,62 @@ class ConfirmAfterExpiryTest extends AbstractIntegrationTest {
         paymentService.pay(fastBooking, false, UUID.randomUUID().toString());
         assertThat(fixtures.claimedSeats(classId)).isEqualTo(4);
 
-        // A's payment finally lands. The charge succeeds; the seat does not.
-        PaymentResult result = paymentService.pay(slowBooking, false, UUID.randomUUID().toString());
+        // A's payment finally lands. The seat is reserved before the gateway is
+        // called, so A is refused rather than charged and refunded.
+        assertThatThrownBy(() ->
+                paymentService.pay(slowBooking, false, UUID.randomUUID().toString()))
+                .isInstanceOf(ApiException.class)
+                .satisfies(e -> assertThat(((ApiException) e).getCode())
+                        .isEqualTo("SEAT_UNAVAILABLE"));
 
-        assertThat(result.outcome()).isEqualTo(PaymentResult.Outcome.SEAT_UNAVAILABLE);
-        assertThat(fixtures.bookingStatus(slowBooking)).isEqualTo("CANCELLED");
-        assertThat(fixtures.countPaymentAttempts(slowBooking, "REFUNDED"))
-                .as("the charge must be returned, not kept")
-                .isEqualTo(1);
+        assertThat(fixtures.countPaymentAttempts(slowBooking))
+                .as("no charge may be recorded for a seat that was never granted")
+                .isZero();
         assertThat(fixtures.countByStatus(classId, "CONFIRMED"))
                 .as("the class must not be overbooked by the late payment")
                 .isEqualTo(4);
         assertThat(fixtures.claimedSeats(classId)).isEqualTo(4);
+        fixtures.assertInvariants(classId);
+    }
+
+    @Test
+    @DisplayName("paying an expired booking is refused when the child rebooked meanwhile")
+    void refusesWithoutChargingWhenChildAlreadyRebooked() {
+        // Regression: the expired booking used to reclaim a seat and only then
+        // discover, at confirmation time, that the child already had another
+        // live booking. The unique index rejected the write after the gateway
+        // had been called, rolling back the payment record with the money gone
+        // and answering 500.
+        long classId = fixtures.trialClass(4);
+        long studentId = fixtures.student(fixtures.parent());
+
+        long first = bookingService.createBooking(studentId, classId).id();
+        fixtures.expireHoldNow(first);
+        reaper.releaseExpiredHolds();
+        assertThat(fixtures.bookingStatus(first)).isEqualTo("EXPIRED");
+
+        // Same child books the same class again - allowed, the old row is dead.
+        long second = bookingService.createBooking(studentId, classId).id();
+
+        assertThatThrownBy(() ->
+                paymentService.pay(first, false, UUID.randomUUID().toString()))
+                .isInstanceOf(ApiException.class)
+                .satisfies(e -> assertThat(((ApiException) e).getCode())
+                        .isEqualTo("DUPLICATE_BOOKING"));
+
+        assertThat(fixtures.countPaymentAttempts(first))
+                .as("the gateway must not be called before the conflict is known")
+                .isZero();
+        assertThat(fixtures.bookingStatus(first)).isEqualTo("EXPIRED");
+        assertThat(fixtures.bookingStatus(second)).isEqualTo("PENDING_PAYMENT");
+        assertThat(fixtures.claimedSeats(classId))
+                .as("the rejected attempt must not leak a seat")
+                .isEqualTo(1);
+        fixtures.assertInvariants(classId);
+
+        // The live booking is still payable afterwards.
+        paymentService.pay(second, false, UUID.randomUUID().toString());
+        assertThat(fixtures.bookingStatus(second)).isEqualTo("CONFIRMED");
         fixtures.assertInvariants(classId);
     }
 

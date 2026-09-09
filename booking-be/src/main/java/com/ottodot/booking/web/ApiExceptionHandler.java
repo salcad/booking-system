@@ -8,9 +8,10 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.FieldError;
-import org.springframework.web.ErrorResponseException;
+import org.springframework.web.ErrorResponse;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 /**
@@ -44,21 +45,40 @@ public class ApiExceptionHandler {
     }
 
     /**
-     * Spring's own signalling exceptions (unknown route, wrong method,
-     * unsupported media type) already carry the right status. Without this they
-     * would fall into the catch-all below and be reported as 500s.
+     * An unparseable path variable or query parameter — /api/bookings/abc —
+     * is a bad request. This one does not implement ErrorResponse either, so
+     * without it the catch-all would call the caller's typo a server fault.
      */
-    @ExceptionHandler(ErrorResponseException.class)
-    public ProblemDetail handleErrorResponse(ErrorResponseException e) {
-        ProblemDetail pd = e.getBody();
-        if (pd.getProperties() == null || !pd.getProperties().containsKey("code")) {
-            pd.setProperty("code", "HTTP_" + e.getStatusCode().value());
-        }
-        return pd;
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ProblemDetail handleTypeMismatch(MethodArgumentTypeMismatchException e) {
+        return problem(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR",
+                e.getName() + " is not a valid value.");
     }
 
+    /**
+     * Spring's own signalling exceptions (unknown route, wrong method,
+     * unsupported media type) already carry the right status, so they are
+     * passed through rather than reported as 500s.
+     *
+     * <p>The branch lives inside the catch-all deliberately. Nearly all of
+     * these merely implement {@link ErrorResponse} without extending
+     * ErrorResponseException — NoResourceFoundException and
+     * HttpRequestMethodNotSupportedException both extend ServletException — and
+     * an @ExceptionHandler cannot name an interface, since it must name a
+     * Throwable. Matching on the concrete class caught almost none of them.
+     */
     @ExceptionHandler(Exception.class)
     public ProblemDetail handleUnexpected(Exception e) {
+        if (e instanceof ErrorResponse signalled) {
+            ProblemDetail pd = signalled.getBody();
+            if (pd.getProperties() == null || !pd.getProperties().containsKey("code")) {
+                // Distinct from the domain codes on purpose: a 404 for an
+                // unknown route is not the same thing as a booking that does
+                // not exist, and the frontend must not conflate them.
+                pd.setProperty("code", "HTTP_" + pd.getStatus());
+            }
+            return pd;
+        }
         log.error("unhandled exception", e);
         return problem(HttpStatus.INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Unexpected error");
     }

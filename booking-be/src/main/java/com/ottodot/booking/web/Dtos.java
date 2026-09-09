@@ -4,6 +4,7 @@ import com.ottodot.booking.domain.Booking;
 import com.ottodot.booking.domain.BookingEvent;
 import com.ottodot.booking.domain.BookingStatus;
 import com.ottodot.booking.domain.TrialClass;
+import com.ottodot.booking.repo.StudentRepository;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import java.time.Instant;
@@ -22,7 +23,37 @@ public final class Dtos {
         }
     }
 
-    public record StudentView(long id, String name, String grade) {
+    /**
+     * A child, optionally with the booking they already hold for the class the
+     * caller asked about.
+     *
+     * <p>{@code existingBooking} is null both when the child has no live
+     * booking and when no class was named in the request, which is why the
+     * field is a nested object rather than loose id/status columns: absent and
+     * "asked, and there is none" collapse to the same JSON either way, and the
+     * nesting at least keeps the two fields from drifting apart.
+     */
+    public record StudentView(long id, String name, String grade,
+                              ExistingBooking existingBooking) {
+        public static StudentView of(StudentRepository.StudentBooking s) {
+            return new StudentView(s.id(), s.name(), s.grade(),
+                    s.liveBookingId() == null ? null
+                            : new ExistingBooking(s.liveBookingId(), s.liveBookingStatus()));
+        }
+    }
+
+    /** The live booking blocking a second one for this child, per invariant I2. */
+    public record ExistingBooking(long bookingId, BookingStatus status) {
+    }
+
+    public record LoginRequest(@NotBlank String password) {
+    }
+
+    /** The token the caller must present on every subsequent request. */
+    public record LoginResponse(String token, Instant expiresAt) {
+    }
+
+    public record SessionView(boolean authenticated) {
     }
 
     public record CreateBookingRequest(@NotNull Long studentId, @NotNull Long trialClassId) {

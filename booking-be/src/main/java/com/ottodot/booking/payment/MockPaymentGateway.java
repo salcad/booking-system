@@ -33,10 +33,4 @@ public class MockPaymentGateway implements PaymentGateway {
                 bookingId, amountCents, ref);
         return ChargeResult.approved(ref);
     }
-
-    @Override
-    public void refund(String providerRef) {
-        log.warn("mock REFUND issued providerRef={} (seat lost after successful charge)",
-                providerRef);
-    }
 }

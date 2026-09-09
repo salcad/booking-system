@@ -13,9 +13,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class RaceDemoController {
 
     private final RaceDemoService raceDemo;
+    private final DemoResetService demoReset;
 
-    public RaceDemoController(RaceDemoService raceDemo) {
+    public RaceDemoController(RaceDemoService raceDemo, DemoResetService demoReset) {
         this.raceDemo = raceDemo;
+        this.demoReset = demoReset;
     }
 
     public record RaceRequest(@NotNull Long trialClassId, Integer contenders) {
@@ -27,5 +29,11 @@ public class RaceDemoController {
     @PostMapping("/race")
     public RaceDemoService.RaceReport race(@Valid @RequestBody RaceRequest req) {
         return raceDemo.run(req.trialClassId(), req.contendersOrDefault());
+    }
+
+    /** Wipes every booking, student and class and replays the seed fixtures. */
+    @PostMapping("/reset")
+    public DemoResetService.ResetReport reset() {
+        return demoReset.reset();
     }
 }

@@ -132,7 +132,7 @@ public class RaceDemoService {
             String outcome = switch (result.outcome()) {
                 case CONFIRMED, ALREADY_CONFIRMED -> "CONFIRMED";
                 case DECLINED -> "PAYMENT_DECLINED";
-                case SEAT_UNAVAILABLE -> "REFUNDED_SEAT_LOST";
+                case SEAT_UNAVAILABLE -> "SEAT_LOST";
             };
             return new Attempt(index, studentId, bookingId, "PAID", outcome, result.message());
         } catch (ApiException e) {

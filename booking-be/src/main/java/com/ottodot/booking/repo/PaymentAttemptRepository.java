@@ -45,12 +45,6 @@ public class PaymentAttemptRepository {
                 Long.class, bookingId, idempotencyKey, amountCents, status.name(), providerRef);
     }
 
-    public void markRefunded(long paymentAttemptId) {
-        jdbc.update(
-                "UPDATE payment_attempts SET status = 'REFUNDED' WHERE id = ?",
-                paymentAttemptId);
-    }
-
     public Optional<PaymentAttempt> findLatest(long bookingId) {
         return jdbc.query(
                 "SELECT " + COLS + " FROM payment_attempts WHERE booking_id = ? "

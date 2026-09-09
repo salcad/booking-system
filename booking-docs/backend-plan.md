@@ -232,7 +232,7 @@ Errors use RFC 7807 `application/problem+json`.
 | `GET` | `/api/trial-classes` | List classes with `seatsRemaining` | 200 |
 | `GET` | `/api/trial-classes/{id}` | Single class detail | 200, 404 |
 | `GET` | `/api/trial-classes/{id}/roster` | Confirmed students only | 200 |
-| `GET` | `/api/parents/{id}/students` | Children for the booking form | 200 |
+| `GET` | `/api/parents/{id}/students` | Children for the booking form; `?trialClassId=` adds each child's live booking | 200 |
 | `POST` | `/api/bookings` | Claim a seat, create hold | 201, 409 `CLASS_FULL`, 409 `DUPLICATE_BOOKING` |
 | `POST` | `/api/bookings/{id}/payment` | Mock charge + confirm | 200, 402 `PAYMENT_DECLINED`, 409 `SEAT_UNAVAILABLE` |
 | `GET` | `/api/bookings/{id}` | Status for the result screen | 200, 404 |
@@ -426,3 +426,92 @@ so the seed file stays free to change for demo purposes.
 - `RaceDemoService` uses a `CyclicBarrier`, not a start latch, so contenders
   genuinely collide instead of trickling through and making the demo look safer
   than it is.
+
+### 12.5 Reserve before charging — the refund path removed (code review)
+
+A later review found that §4.3's confirmation logic could charge a parent and
+*then* fail. The plan assumed the only thing that could go wrong after a
+successful charge was losing the seat, which the refund handled. It missed a
+second failure: the child acquiring **another live booking** for the class while
+the first hold sat expired.
+
+Reproduction: book → let the hold expire → book the same class again for the
+same child → pay the first booking. The seat reclaim succeeds (capacity remains),
+but confirming makes two rows live for one `(student, class)` pair, so
+`uq_live_booking` rejects the write. `DuplicateKeyException` is not an
+`ApiException`, so it escaped as **HTTP 500** — and because it rolled the
+transaction back, the `payment_attempts` row went with it. Verified: the charge
+happened, no record survived, no refund ran.
+
+The fix inverts the order. For an expired hold, both reservations are taken
+**before** the gateway is called:
+
+1. `tryClaimSeat` — fails → `409 SEAT_UNAVAILABLE`, uncharged.
+2. `reopenHold` (`EXPIRED → PENDING_PAYMENT`) — the partial unique index rejects
+   it if the child has rebooked → `409 DUPLICATE_BOOKING`, uncharged. The
+   rollback undoes the seat claim from step 1, so no compensating code is
+   needed.
+
+Confirming afterwards cannot fail: the seat is claimed, the live slot is held,
+and the row is locked. **This makes the refund path unreachable, so it was
+deleted** — along with `PaymentGateway.refund`, `markRefunded`, and the
+`refunds_issued` counter. Refusing before taking money is strictly better than
+taking it and giving it back, and it removes an entire class of partial failure.
+
+`PaymentStatus.REFUNDED` survives, because the database enum still declares it
+and a future asynchronous gateway would need it: with webhook-driven payment the
+money can genuinely arrive after the seat is gone, and reserve-before-charge is
+no longer available. That is called out in the README's "what next".
+
+### 12.6 Cancellation restricted to held seats (code review)
+
+`cancel()` guarded on `isLive()`, which includes `CONFIRMED`. A paid booking
+could therefore be cancelled: the child came off the roster and the seat was
+released, while the payment stayed `SUCCEEDED` — a refund the system never
+issued. Replaying the original idempotency key then reported `CONFIRMED`
+alongside a `CANCELLED` booking.
+
+The endpoint is documented as "release a held seat", so it now accepts only
+`PENDING_PAYMENT` and answers `409 NOT_CANCELLABLE` otherwise. Releasing a paid
+seat is a refund workflow, and this system deliberately has none.
+`describeExisting` was also corrected: a `SUCCEEDED` attempt now always reports
+`ALREADY_CONFIRMED` and logs an error if the booking is not actually confirmed,
+rather than quietly reporting success for a booking in some other state.
+
+### 12.7 Known and accepted: roster read consistency
+
+`RosterService.forClass` issues separate queries for the class, the confirmed
+bookings, and the pending holds. Under Postgres `READ COMMITTED` — the
+configured default — each statement gets its own snapshot, so a payment
+committing between the second and third query can produce a response where a
+child appears in neither list.
+
+Left as-is deliberately. It is a read-only view, the inconsistency is transient,
+it cannot corrupt data, and the roster page re-polls every five seconds. The fix
+is cheap if it ever matters: one `JOIN` (which would also remove the N+1 student
+lookup in `toEntries`), or `@Transactional(isolation = REPEATABLE_READ)`.
+
+### 12.8 The students endpoint reports existing bookings (UI defect)
+
+`GET /api/parents/{id}/students` now takes an optional `?trialClassId=`, and
+each child in the response carries `existingBooking: {bookingId, status}` for
+that class, or null.
+
+Not in the plan because the plan only ever asked what the API must *enforce*.
+I2 is enforced by `uq_live_booking` and surfaced as a 409, which is complete as
+a contract — and it left the booking form with no way to know a child was
+already enrolled except by attempting the booking and reading the rejection.
+The parent got an error for something the page could have known before they
+clicked. Enforcement is not the same as discoverability, and §5 only specified
+the first.
+
+The new query's definition of a live booking is the same `status IN
+('PENDING_PAYMENT', 'CONFIRMED')` as the index and as `findLive`, and must stay
+so: a predicate that drifts wider would grey out a child the write path would
+accept, locking a parent out of a class — a worse and quieter failure than the
+extra round-trip it replaces. `StudentBookingStateTest` pins every excluded
+status (`PAYMENT_FAILED`, `EXPIRED`) from the outside over HTTP.
+
+The pre-check is advisory. It is a separate read from the insert, so it cannot
+see a booking made in the gap, and the 409 path remains the only thing that
+actually rejects a duplicate.

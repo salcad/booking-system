@@ -1,7 +1,9 @@
 package com.ottodot.booking;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.ottodot.booking.error.ApiException;
 import com.ottodot.booking.service.BookingService;
 import com.ottodot.booking.service.PaymentResult;
 import com.ottodot.booking.service.PaymentService;
@@ -83,6 +85,37 @@ class PaymentFailureTest extends AbstractIntegrationTest {
 
         assertThat(fixtures.bookingStatus(booking)).isEqualTo("CONFIRMED");
         assertThat(fixtures.countByStatus(classId, "CONFIRMED")).isEqualTo(4);
+        fixtures.assertInvariants(classId);
+    }
+
+    @Test
+    @DisplayName("a paid booking cannot be cancelled by the hold-release endpoint")
+    void confirmedBookingCannotBeCancelled() {
+        // Regression: cancel() accepted any live booking, so a CONFIRMED one
+        // could be taken off the roster and have its seat released while its
+        // payment stayed SUCCEEDED - a refund that never happened.
+        long classId = fixtures.trialClass(4);
+        long studentId = fixtures.student(fixtures.parent());
+        long bookingId = bookingService.createBooking(studentId, classId).id();
+        String key = UUID.randomUUID().toString();
+        paymentService.pay(bookingId, false, key);
+        assertThat(fixtures.bookingStatus(bookingId)).isEqualTo("CONFIRMED");
+
+        assertThatThrownBy(() -> bookingService.cancel(bookingId))
+                .isInstanceOf(ApiException.class)
+                .satisfies(e -> assertThat(((ApiException) e).getCode())
+                        .isEqualTo("NOT_CANCELLABLE"));
+
+        assertThat(fixtures.bookingStatus(bookingId)).isEqualTo("CONFIRMED");
+        assertThat(fixtures.claimedSeats(classId))
+                .as("a paid seat must not be released")
+                .isEqualTo(1);
+        assertThat(rosterService.forClass(classId).confirmed()).hasSize(1);
+
+        // Replaying the original key must agree with the booking's real state.
+        PaymentResult replay = paymentService.pay(bookingId, false, key);
+        assertThat(replay.outcome()).isEqualTo(PaymentResult.Outcome.ALREADY_CONFIRMED);
+        assertThat(replay.booking().status().name()).isEqualTo("CONFIRMED");
         fixtures.assertInvariants(classId);
     }
 

@@ -114,7 +114,12 @@ public class BookingService {
         if (booking.status() == BookingStatus.CANCELLED) {
             return booking;
         }
-        if (!booking.status().isLive()) {
+        // Deliberately PENDING_PAYMENT only, not isLive(). Cancelling a
+        // CONFIRMED booking would take a paid child off the roster and release
+        // their seat while their payment stayed SUCCEEDED - a refund the system
+        // never issued. Releasing paid seats is a refund workflow, and this
+        // endpoint is scoped to releasing a held one.
+        if (booking.status() != BookingStatus.PENDING_PAYMENT) {
             throw ApiException.conflict("NOT_CANCELLABLE",
                     "Booking is " + booking.status() + " and cannot be cancelled.");
         }

@@ -17,6 +17,15 @@ booking:
   hold-duration: PT10M
   reaper-interval-ms: 30000
   trial-price-cents: 4900
+  auth:
+    # The shared password for the demo. Override in any real deployment.
+    password: ${AUTH_PASSWORD:644k1n9}
+    # Blank means a random key per boot: sessions end at restart and are not
+    # shared between instances. Set AUTH_SECRET to keep them across either.
+    secret: ${AUTH_SECRET:}
+    session-duration: PT12H
+    max-attempts: 10
+    lockout-window: PT15M
 
 management:
   endpoints:
@@ -32,4 +41,4 @@ logging:
     com.ottodot.booking: DEBUG
 
 server:
-  port: 8080
+  port: 8074
