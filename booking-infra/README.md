@@ -49,7 +49,19 @@ Check it came up:
 
 ```bash
 docker compose ps          # all three should read healthy
-curl localhost/api/trial-classes
+curl -i localhost:8073/api/trial-classes    # 401 UNAUTHENTICATED
+```
+
+`8073` is the only published port — `web`. The API is internal, so
+`localhost:8074` refuses the connection by design, and nothing answers on `:80`
+unless the tls profile below is running. The `401` is the success case: the
+request reached the API through Next's `/api/*` rewrite and the password gate
+turned it away. To see the data, log in first:
+
+```bash
+TOKEN=$(curl -s localhost:8073/api/auth/login \
+  -H 'content-type: application/json' -d '{"password":"644k1n9"}' | jq -r .token)
+curl -s localhost:8073/api/trial-classes -H "Authorization: Bearer $TOKEN"
 ```
 
 ### With HTTPS
